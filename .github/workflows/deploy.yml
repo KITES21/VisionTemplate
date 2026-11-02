@@ -308,6 +308,9 @@ jobs:
           # HANDLE DEPLOYMENT FAILURE
           # -----------------------------------------------
 
+          # TEMPORARY: FORCE ROLLBACK TEST
+          DEPLOYMENT_SUCCESS=false
+
           if [[ "$DEPLOYMENT_SUCCESS" != "true" ]]; then
 
             echo "ERROR: New deployment failed health checks."
