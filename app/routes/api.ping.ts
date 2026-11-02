@@ -10,7 +10,7 @@ export async function loader(_: Route.LoaderArgs) {
     },
     { status: 503 }
   );
-
+}
 // // GET /api/ping — health check, proves the backend is answering
 // export async function loader(_: Route.LoaderArgs) {
 //   return Response.json({
