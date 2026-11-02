@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: visiontemplate-production
@@ -20,19 +19,23 @@ env:
   IMAGE_NAME: ghcr.io/kites21/visiontemplate
 
 jobs:
-  build-and-deploy:
+  # -----------------------------------------------
+  # JOB 1: BUILD AND PUSH TO GHCR
+  # -----------------------------------------------
+  build:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      packages: write
+
     steps:
-      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Enable Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3. Authenticate with GHCR
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -40,7 +43,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4. Build and push image
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -52,93 +54,124 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 5. Deploy to EC2
-      - name: Deploy to EC2 with rollback
-        uses: appleboy/ssh-action@v1.2.0
+  # -----------------------------------------------
+  # JOB 2: DEPLOY DIRECTLY ON EC2
+  # -----------------------------------------------
+  deploy:
+    needs: build
+
+    runs-on: [self-hosted, linux, x64, Vision_runner]
+
+    steps:
+      - name: Deploy application with automatic rollback
+        shell: bash
         env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
           IMAGE_TAG: ${{ github.sha }}
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE_TAG,GHCR_USERNAME,GHCR_PAT
-          script: |
-            set -eu
+        run: |
+          set -Eeuo pipefail
 
-            cd /opt/visiontemplate
+          cd /opt/visiontemplate
 
-            echo "Starting deployment..."
+          echo "Starting VisionTemplate deployment..."
+          echo "New image: ${IMAGE_NAME}:${IMAGE_TAG}"
 
-            # Save current version
-            OLD_TAG=$(sed -n 's/^IMAGE_TAG=//p' .env | tail -n 1)
+          # Read current deployment version
+          OLD_APP_IMAGE=$(sed -n 's/^APP_IMAGE=//p' .env | tail -n 1)
+          OLD_TAG=$(sed -n 's/^IMAGE_TAG=//p' .env | tail -n 1)
 
-            if [ -z "$OLD_TAG" ]; then
-              echo "No previous IMAGE_TAG found."
-              exit 1
-            fi
+          if [[ -z "$OLD_APP_IMAGE" || -z "$OLD_TAG" ]]; then
+            echo "ERROR: Existing deployment version not found."
+            exit 1
+          fi
 
-            echo "Previous version: $OLD_TAG"
-            echo "New version: $IMAGE_TAG"
+          echo "Previous image: ${OLD_APP_IMAGE}:${OLD_TAG}"
 
-            # Authenticate with private GHCR
-            echo "$GHCR_PAT" | docker login ghcr.io \
-              -u "$GHCR_USERNAME" --password-stdin
+          # Verify that the previous image is available for rollback
+          if ! docker image inspect "${OLD_APP_IMAGE}:${OLD_TAG}" >/dev/null 2>&1; then
+            echo "ERROR: Previous image is unavailable locally."
+            echo "Refusing to deploy without a rollback image."
+            exit 1
+          fi
 
-            # Download new image before changing deployment
-            docker pull "${APP_IMAGE:-ghcr.io/kites21/visiontemplate}:$IMAGE_TAG"
+          # Verify GHCR authentication for the actions account
+          if ! docker pull "${IMAGE_NAME}:${IMAGE_TAG}"; then
+            echo "ERROR: Unable to pull the new GHCR image."
+            exit 1
+          fi
 
-            # Rollback handler
-            rollback() {
-              echo "Deployment failed. Rolling back..."
+          # Rollback function
+          rollback() {
+            echo "Deployment failed. Restoring previous version..."
 
-              sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$OLD_TAG/" .env
-
-              docker compose up -d --no-deps app
-
-              echo "Checking previous deployment..."
-
-              for i in $(seq 1 30); do
-                if curl -fsS http://127.0.0.1/api/ping >/dev/null; then
-                  echo "Rollback successful."
-                  return 0
-                fi
-                sleep 5
-              done
-
-              echo "WARNING: Rollback health check failed."
-              return 1
-            }
-
-            # Activate new version
-            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$IMAGE_TAG/" .env
+            sed -i \
+              -e "s|^APP_IMAGE=.*|APP_IMAGE=${OLD_APP_IMAGE}|" \
+              -e "s|^IMAGE_TAG=.*|IMAGE_TAG=${OLD_TAG}|" \
+              .env
 
             if ! docker compose up -d --no-deps app; then
-              rollback
-              exit 1
+              echo "CRITICAL: Could not restart previous application."
+              return 1
             fi
 
-            # Wait for application health
-            echo "Checking application health..."
-
-            HEALTHY=0
+            echo "Checking rollback health..."
 
             for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1/api/ping >/dev/null; then
-                HEALTHY=1
-                break
+              if curl -fsS "http://127.0.0.1:$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)/api/ping" >/dev/null; then
+                echo "Rollback successful."
+                return 0
               fi
 
-              echo "Waiting for application... ($i/30)"
               sleep 5
             done
 
-            if [ "$HEALTHY" -ne 1 ]; then
-              rollback
-              exit 1
+            echo "CRITICAL: Previous application did not become healthy."
+            return 1
+          }
+
+          # Update deployment variables
+          sed -i \
+            -e "s|^APP_IMAGE=.*|APP_IMAGE=${IMAGE_NAME}|" \
+            -e "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" \
+            .env
+
+          # Start the new application image
+          if ! docker compose up -d --no-deps app; then
+            rollback
+            exit 1
+          fi
+
+          # Wait for application health
+          echo "Waiting for application health..."
+
+          APP_PORT=$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)
+
+          if [[ ! "$APP_PORT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid APP_PORT."
+            rollback
+            exit 1
+          fi
+
+          HEALTHY=0
+
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${APP_PORT}/api/ping" >/dev/null; then
+              HEALTHY=1
+              break
             fi
 
-            echo "Deployment successful!"
+            echo "Waiting for application... (${i}/30)"
+            sleep 5
+          done
 
-            docker image prune -f
+          if [[ "$HEALTHY" -ne 1 ]]; then
+            echo "ERROR: New deployment failed health checks."
+            rollback
+            exit 1
+          fi
+
+          echo "Deployment successful!"
+          echo "Running image: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+          # Remove dangling images only
+          docker image prune -f
