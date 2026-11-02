@@ -68,6 +68,7 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           IMAGE_TAG: ${{ github.sha }}
+          FORCE_ROLLBACK_TEST: "true"
         run: |
           set -Eeuo pipefail
 
@@ -138,6 +139,13 @@ jobs:
           # Start the new application image
           if ! docker compose up -d --no-deps app; then
             rollback
+            exit 1
+          fi
+
+          if [[ "${FORCE_ROLLBACK_TEST:-false}" == "true" ]]; then
+            echo "TEST: Simulating deployment failure..."
+            rollback
+            echo "TEST: Rollback completed. Marking test run as failed."
             exit 1
           fi
 
