@@ -1,4 +1,8 @@
 
+# -----------------------------------------------
+# VISIONTEMPLATE - BUILD, DEPLOY & ROLLBACK
+# -----------------------------------------------
+
 name: Build and Deploy VisionTemplate
 
 on:
@@ -8,20 +12,19 @@ on:
 
   workflow_dispatch:
 
-permissions:
-  contents: read
-
-concurrency:
-  group: visiontemplate-production
-  cancel-in-progress: false
+# -----------------------------------------------
+# GLOBAL ENVIRONMENT VARIABLES
+# -----------------------------------------------
 
 env:
   IMAGE_NAME: ghcr.io/kites21/visiontemplate
 
 jobs:
+
   # -----------------------------------------------
-  # JOB 1: BUILD AND PUSH TO GHCR
+  # JOB 1: BUILD AND PUSH DOCKER IMAGE TO GHCR
   # -----------------------------------------------
+
   build:
     runs-on: ubuntu-latest
 
@@ -30,18 +33,35 @@ jobs:
       packages: write
 
     steps:
+
+      # -----------------------------------------------
+      # STEP 1: CHECKOUT SOURCE CODE
+      # -----------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # -----------------------------------------------
+      # STEP 2: SETUP DOCKER BUILDX
+      # -----------------------------------------------
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      # -----------------------------------------------
+      # STEP 3: LOGIN TO GITHUB CONTAINER REGISTRY
+      # -----------------------------------------------
+
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------
+      # STEP 4: BUILD AND PUSH IMAGE
+      # -----------------------------------------------
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -57,129 +77,265 @@ jobs:
   # -----------------------------------------------
   # JOB 2: DEPLOY DIRECTLY ON EC2
   # -----------------------------------------------
+
   deploy:
     needs: build
 
     runs-on: [self-hosted, linux, x64, Vision_runner]
 
     steps:
+
+      # -----------------------------------------------
+      # STEP 1: DEPLOY APPLICATION WITH AUTOMATIC ROLLBACK
+      # -----------------------------------------------
+
       - name: Deploy application with automatic rollback
         shell: bash
+
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          IMAGE_TAG: ${{ github.sha }}
-          FORCE_ROLLBACK_TEST: "true"
+          DEPLOY_IMAGE_TAG: ${{ github.sha }}
+
         run: |
+
+          # -----------------------------------------------
+          # INITIALIZE DEPLOYMENT
+          # -----------------------------------------------
+
           set -Eeuo pipefail
 
           cd /opt/visiontemplate
 
-          echo "Starting VisionTemplate deployment..."
-          echo "New image: ${IMAGE_NAME}:${IMAGE_TAG}"
+          NEW_IMAGE="${IMAGE_NAME}:${DEPLOY_IMAGE_TAG}"
 
-          # Read current deployment version
+          echo "-----------------------------------------------"
+          echo "Starting VisionTemplate deployment"
+          echo "-----------------------------------------------"
+
+          echo "New image: ${NEW_IMAGE}"
+
+          # -----------------------------------------------
+          # READ CURRENT DEPLOYMENT CONFIGURATION
+          # -----------------------------------------------
+
           OLD_APP_IMAGE=$(sed -n 's/^APP_IMAGE=//p' .env | tail -n 1)
           OLD_TAG=$(sed -n 's/^IMAGE_TAG=//p' .env | tail -n 1)
+          APP_PORT=$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)
 
-          if [[ -z "$OLD_APP_IMAGE" || -z "$OLD_TAG" ]]; then
-            echo "ERROR: Existing deployment version not found."
+          if [[ -z "$OLD_APP_IMAGE" || -z "$OLD_TAG" || -z "$APP_PORT" ]]; then
+            echo "ERROR: Could not read previous deployment settings."
             exit 1
           fi
 
-          echo "Previous image: ${OLD_APP_IMAGE}:${OLD_TAG}"
-
-          # Verify that the previous image is available for rollback
-          if ! docker image inspect "${OLD_APP_IMAGE}:${OLD_TAG}" >/dev/null 2>&1; then
-            echo "ERROR: Previous image is unavailable locally."
-            echo "Refusing to deploy without a rollback image."
+          if [[ ! "$APP_PORT" =~ ^[0-9]+$ ]] || (( APP_PORT < 1 || APP_PORT > 65535 )); then
+            echo "ERROR: Invalid APP_PORT in .env."
             exit 1
           fi
 
-          # Verify GHCR authentication for the actions account
-          if ! docker pull "${IMAGE_NAME}:${IMAGE_TAG}"; then
-            echo "ERROR: Unable to pull the new GHCR image."
+          OLD_IMAGE="${OLD_APP_IMAGE}:${OLD_TAG}"
+
+          echo "Previous image: ${OLD_IMAGE}"
+
+          # -----------------------------------------------
+          # VERIFY PREVIOUS IMAGE FOR ROLLBACK
+          # -----------------------------------------------
+
+          if ! docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then
+            echo "ERROR: Previous image is not available locally."
             exit 1
           fi
 
-          # Rollback function
+          echo "Previous deployment image is available."
+
+          # -----------------------------------------------
+          # PULL NEW DOCKER IMAGE
+          # -----------------------------------------------
+
+          echo "Pulling new Docker image..."
+
+          if ! docker pull "$NEW_IMAGE"; then
+            echo "ERROR: Failed to pull new image."
+            exit 1
+          fi
+
+          echo "New image pulled successfully."
+
+          # -----------------------------------------------
+          # DEFINE AUTOMATIC ROLLBACK FUNCTION
+          # -----------------------------------------------
+
           rollback() {
-            echo "Deployment failed. Restoring previous version..."
 
+            echo "-----------------------------------------------"
+            echo "DEPLOYMENT FAILED - STARTING ROLLBACK"
+            echo "-----------------------------------------------"
+
+            # Restore previous deployment configuration
             sed -i \
               -e "s|^APP_IMAGE=.*|APP_IMAGE=${OLD_APP_IMAGE}|" \
               -e "s|^IMAGE_TAG=.*|IMAGE_TAG=${OLD_TAG}|" \
-              .env
+              .env || return 1
 
-            if ! docker compose up -d --no-deps app; then
-              echo "CRITICAL: Could not restart previous application."
+            # Restart previous application version
+            env -u IMAGE_TAG -u APP_IMAGE docker compose up -d --no-deps app || return 1
+
+            # -----------------------------------------------
+            # VERIFY ACTUAL ROLLBACK IMAGE
+            # -----------------------------------------------
+
+            ACTUAL_IMAGE=$(docker inspect visiontemplate-app \
+              --format '{{.Config.Image}}' 2>/dev/null || true)
+
+            if [[ "$ACTUAL_IMAGE" != "$OLD_IMAGE" ]]; then
+              echo "CRITICAL: Rollback image mismatch."
+              echo "Expected: ${OLD_IMAGE}"
+              echo "Actual: ${ACTUAL_IMAGE}"
               return 1
             fi
 
+            # -----------------------------------------------
+            # VERIFY ROLLBACK APPLICATION HEALTH
+            # -----------------------------------------------
+
             echo "Checking rollback health..."
 
-            for i in $(seq 1 30); do
-              if curl -fsS "http://127.0.0.1:$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)/api/ping" >/dev/null; then
+            for i in {1..30}; do
+
+              HEALTH=$(docker inspect visiontemplate-app \
+                --format '{{.State.Health.Status}}' 2>/dev/null || true)
+
+              if [[ "$HEALTH" == "healthy" ]] && \
+                curl -fsS "http://127.0.0.1:${APP_PORT}/api/ping" >/dev/null; then
+
                 echo "Rollback successful."
+                echo "Previous version is running and healthy."
+
                 return 0
               fi
 
+              echo "Waiting for rollback health... (${i}/30)"
+
               sleep 5
+
             done
 
-            echo "CRITICAL: Previous application did not become healthy."
+            echo "CRITICAL: Rollback health check failed."
+
             return 1
           }
 
-          # Update deployment variables
-          sed -i \
+          # -----------------------------------------------
+          # UPDATE ENVIRONMENT CONFIGURATION
+          # -----------------------------------------------
+
+          echo "Updating deployment configuration..."
+
+          if ! sed -i \
             -e "s|^APP_IMAGE=.*|APP_IMAGE=${IMAGE_NAME}|" \
-            -e "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" \
-            .env
+            -e "s|^IMAGE_TAG=.*|IMAGE_TAG=${DEPLOY_IMAGE_TAG}|" \
+            .env; then
 
-          # Start the new application image
-          if ! docker compose up -d --no-deps app; then
-            rollback
+            echo "ERROR: Failed to update .env."
+
             exit 1
           fi
 
-          if [[ "${FORCE_ROLLBACK_TEST:-false}" == "true" ]]; then
-            echo "TEST: Simulating deployment failure..."
-            rollback
-            echo "TEST: Rollback completed. Marking test run as failed."
+          # -----------------------------------------------
+          # DEPLOY NEW APPLICATION VERSION
+          # -----------------------------------------------
+
+          echo "Deploying new application version..."
+
+          if ! env -u IMAGE_TAG -u APP_IMAGE docker compose up -d --no-deps app; then
+
+            echo "ERROR: Docker Compose deployment failed."
+
+            if ! rollback; then
+              echo "CRITICAL: Automatic rollback failed."
+            fi
+
             exit 1
           fi
 
-          # Wait for application health
-          echo "Waiting for application health..."
+          # -----------------------------------------------
+          # VERIFY RUNNING DOCKER IMAGE
+          # -----------------------------------------------
 
-          APP_PORT=$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)
+          ACTUAL_IMAGE=$(docker inspect visiontemplate-app \
+            --format '{{.Config.Image}}' 2>/dev/null || true)
 
-          if [[ ! "$APP_PORT" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: Invalid APP_PORT."
-            rollback
+          if [[ "$ACTUAL_IMAGE" != "$NEW_IMAGE" ]]; then
+
+            echo "ERROR: Running image does not match the new image."
+
+            if ! rollback; then
+              echo "CRITICAL: Automatic rollback failed."
+            fi
+
             exit 1
           fi
 
-          HEALTHY=0
+          echo "Running image verified: ${ACTUAL_IMAGE}"
 
-          for i in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${APP_PORT}/api/ping" >/dev/null; then
-              HEALTHY=1
+          # -----------------------------------------------
+          # APPLICATION HEALTH CHECK
+          # -----------------------------------------------
+
+          echo "Checking application health..."
+
+          DEPLOYMENT_SUCCESS=false
+
+          for i in {1..30}; do
+
+            HEALTH=$(docker inspect visiontemplate-app \
+              --format '{{.State.Health.Status}}' 2>/dev/null || true)
+
+            if [[ "$HEALTH" == "healthy" ]] && \
+              curl -fsS "http://127.0.0.1:${APP_PORT}/api/ping" >/dev/null; then
+
+              DEPLOYMENT_SUCCESS=true
+
               break
             fi
 
-            echo "Waiting for application... (${i}/30)"
+            echo "Waiting for application health... (${i}/30)"
+
             sleep 5
+
           done
 
-          if [[ "$HEALTHY" -ne 1 ]]; then
+          # -----------------------------------------------
+          # HANDLE DEPLOYMENT FAILURE
+          # -----------------------------------------------
+
+          if [[ "$DEPLOYMENT_SUCCESS" != "true" ]]; then
+
             echo "ERROR: New deployment failed health checks."
-            rollback
+
+            if ! rollback; then
+              echo "CRITICAL: Automatic rollback failed."
+            fi
+
             exit 1
           fi
 
-          echo "Deployment successful!"
-          echo "Running image: ${IMAGE_NAME}:${IMAGE_TAG}"
+          # -----------------------------------------------
+          # DEPLOYMENT SUCCESS
+          # -----------------------------------------------
 
-          # Remove dangling images only
+          echo "-----------------------------------------------"
+          echo "VISIONTEMPLATE DEPLOYMENT SUCCESSFUL"
+          echo "-----------------------------------------------"
+
+          echo "Running image: ${NEW_IMAGE}"
+          echo "Application health: ${HEALTH}"
+
+          # -----------------------------------------------
+          # CLEANUP DANGLING DOCKER IMAGES
+          # -----------------------------------------------
+
+          echo "Cleaning up dangling Docker images..."
+
           docker image prune -f
+
+          echo "Deployment process completed."
