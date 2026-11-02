@@ -1,13 +1,24 @@
 import type { Route } from "./+types/api.ping";
 
-// GET /api/ping — health check, proves the backend is answering
+// GET /api/ping — intentionally unhealthy for rollback testing
 export async function loader(_: Route.LoaderArgs) {
-  return Response.json({
-    pong: true,
-    serverTime: new Date().toISOString(),
-    uptimeSeconds: Math.round(process.uptime()),
-  });
+  return Response.json(
+    {
+      pong: false,
+      error: "Simulated health check failure",
+      serverTime: new Date().toISOString(),
+    },
+    { status: 503 }
+  );
 }
+// // GET /api/ping — health check, proves the backend is answering
+// export async function loader(_: Route.LoaderArgs) {
+//   return Response.json({
+//     pong: true,
+//     serverTime: new Date().toISOString(),
+//     uptimeSeconds: Math.round(process.uptime()),
+//   });
+// }
 
 // POST /api/ping — echoes back whatever { message } you send
 export async function action({ request }: Route.ActionArgs) {
