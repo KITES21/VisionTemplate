@@ -1,0 +1,144 @@
+
+name: Build and Deploy VisionTemplate
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: visiontemplate-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/kites21/visiontemplate
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Enable Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Authenticate with GHCR
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. Build and push image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 5. Deploy to EC2
+      - name: Deploy to EC2 with rollback
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_TAG,GHCR_USERNAME,GHCR_PAT
+          script: |
+            set -eu
+
+            cd /opt/visiontemplate
+
+            echo "Starting deployment..."
+
+            # Save current version
+            OLD_TAG=$(sed -n 's/^IMAGE_TAG=//p' .env | tail -n 1)
+
+            if [ -z "$OLD_TAG" ]; then
+              echo "No previous IMAGE_TAG found."
+              exit 1
+            fi
+
+            echo "Previous version: $OLD_TAG"
+            echo "New version: $IMAGE_TAG"
+
+            # Authenticate with private GHCR
+            echo "$GHCR_PAT" | docker login ghcr.io \
+              -u "$GHCR_USERNAME" --password-stdin
+
+            # Download new image before changing deployment
+            docker pull "${APP_IMAGE:-ghcr.io/kites21/visiontemplate}:$IMAGE_TAG"
+
+            # Rollback handler
+            rollback() {
+              echo "Deployment failed. Rolling back..."
+
+              sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$OLD_TAG/" .env
+
+              docker compose up -d --no-deps app
+
+              echo "Checking previous deployment..."
+
+              for i in $(seq 1 30); do
+                if curl -fsS http://127.0.0.1/api/ping >/dev/null; then
+                  echo "Rollback successful."
+                  return 0
+                fi
+                sleep 5
+              done
+
+              echo "WARNING: Rollback health check failed."
+              return 1
+            }
+
+            # Activate new version
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$IMAGE_TAG/" .env
+
+            if ! docker compose up -d --no-deps app; then
+              rollback
+              exit 1
+            fi
+
+            # Wait for application health
+            echo "Checking application health..."
+
+            HEALTHY=0
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1/api/ping >/dev/null; then
+                HEALTHY=1
+                break
+              fi
+
+              echo "Waiting for application... ($i/30)"
+              sleep 5
+            done
+
+            if [ "$HEALTHY" -ne 1 ]; then
+              rollback
+              exit 1
+            fi
+
+            echo "Deployment successful!"
+
+            docker image prune -f
