@@ -7,7 +7,7 @@ export async function loader(_: Route.LoaderArgs) {
     serverTime: new Date().toISOString(),
     uptimeSeconds: Math.round(process.uptime()),
   });
-}
+} 
 
 // POST /api/ping — echoes back whatever { message } you send
 export async function action({ request }: Route.ActionArgs) {
